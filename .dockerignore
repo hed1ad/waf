@@ -1,0 +1,10 @@
+.git
+.git-archives
+.claude
+.codex
+**/.git
+**/node_modules
+**/.next
+*.log
+tmp
+README.local.md

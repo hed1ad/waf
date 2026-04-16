@@ -1,0 +1,177 @@
+services:
+
+  # ─── Data plane ───────────────────────────────────────────────────────────
+  nginx:
+    image: owasp/modsecurity-crs:nginx-alpine
+    container_name: waf-nginx
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    volumes:
+      # Mount as template so the entrypoint envsubst script can write it normally
+      - ./nginx/modsecurity.conf:/etc/nginx/templates/modsecurity.d/modsecurity-override.conf.template:ro
+      - ./nginx/rules:/etc/modsecurity.d/custom-rules:ro
+      - audit_logs:/var/log/modsecurity/audit
+      - nginx_logs:/var/log/nginx
+    environment:
+      BACKEND: "http://origin:80"
+      PORT: "8080"
+      MODSEC_AUDIT_LOG_FORMAT: JSON
+      MODSEC_AUDIT_LOG_TYPE: Concurrent
+      MODSEC_AUDIT_STORAGE_DIR: /var/log/modsecurity/audit
+      MODSEC_RULE_ENGINE: "On"
+      PARANOIA: 1
+      ANOMALY_INBOUND: 5
+      ANOMALY_OUTBOUND: 4
+    depends_on:
+      - origin
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+  origin:
+    image: kennethreitz/httpbin:latest
+    container_name: waf-origin
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+  # ─── Storage ──────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: waf-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface (для отладки)
+      - "9000:9000"   # native protocol (ingester)
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./deploy/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./deploy/clickhouse/listen.xml:/etc/clickhouse-server/config.d/listen.xml:ro
+    environment:
+      CLICKHOUSE_USER: waf
+      CLICKHOUSE_PASSWORD: wafpass
+      CLICKHOUSE_DB: waf
+    networks:
+      - waf-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: waf-postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      POSTGRES_USER: waf
+      POSTGRES_PASSWORD: wafpass
+      POSTGRES_DB: waf
+    networks:
+      - waf-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U waf"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: waf-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+  # ─── Application ──────────────────────────────────────────────────────────
+  ingester:
+    build:
+      context: ./ingester
+      dockerfile: Dockerfile
+    container_name: waf-ingester
+    volumes:
+      - audit_logs:/var/log/modsecurity/audit:ro
+      - nginx_logs:/var/log/nginx:ro
+    environment:
+      AUDIT_LOG_DIR: /var/log/modsecurity/audit
+      NGINX_ACCESS_LOG: /var/log/nginx/access.log
+      CLICKHOUSE_DSN: "clickhouse://waf:wafpass@clickhouse:9000/waf"
+      REDIS_ADDR: "redis:6379"
+      GEOIP_CITY_DB: /data/GeoLite2-City.mmdb
+      GEOIP_ASN_DB: /data/GeoLite2-ASN.mmdb
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: waf-api
+    ports:
+      - "4000:4000"
+    environment:
+      HTTP_PORT: "4000"
+      CLICKHOUSE_DSN: "clickhouse://waf:wafpass@clickhouse:9000/waf"
+      POSTGRES_DSN: "postgres://waf:wafpass@postgres:5432/waf?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      JWT_SECRET: "change-me-in-production"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: waf-dashboard
+    ports:
+      - "3001:3000"
+    environment:
+      API_URL: "http://api:4000"
+      NEXT_PUBLIC_API_URL: "http://localhost:4000"
+    depends_on:
+      - api
+    networks:
+      - waf-net
+    restart: unless-stopped
+
+# ─── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  audit_logs:
+  nginx_logs:
+  clickhouse_data:
+  postgres_data:
+  redis_data:
+
+# ─── Networks ───────────────────────────────────────────────────────────────
+networks:
+  waf-net:
+    driver: bridge

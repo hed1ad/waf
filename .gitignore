@@ -1,0 +1,36 @@
+.git/
+.git-archives/
+.claude/
+.codex
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs and runtime data
+*.log
+audit.log
+
+# Environment overrides
+.env
+.env.*
+!.env.example
+
+# Go build artifacts
+bin/
+dist/
+coverage.out
+
+# Docker bind/runtime data
+tmp/
+
+# Dashboard
+/dashboard/.next/
+/dashboard/node_modules/
+/dashboard/.vercel/
+
+# Local data files
+*.mmdb
